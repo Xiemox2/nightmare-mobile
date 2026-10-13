@@ -75,6 +75,8 @@ object WanVideoNode : NodeType {
         Widget("size", "string", SIZE_480, options = listOf(SIZE_480, SIZE_704), hintRes = R.string.hint_wan_size),
         Widget("seed", "int", "0", hintRes = R.string.hint_seed_clip),
         Widget("seconds", "int", "5", 1.0, MAX_SECONDS.toDouble(), hintRes = R.string.hint_wan_seconds),
+        Widget("steps", "int", "4", 1.0, 50.0, hintRes = R.string.hint_steps),
+        Widget("cfg", "float", "1.0", 0.0, 20.0, hintRes = R.string.hint_cfg),
         // ⭐ The framing, exactly as [VideoSampleNode] carries it.
         Widget("x", "float", "0.0", 0.0, 1.0, hintRes = R.string.hint_drag_frame),
         Widget("y", "float", "0.0", 0.0, 1.0),
@@ -147,11 +149,22 @@ object WanVideoNode : NodeType {
                 "node \"${node.id}\": nothing is wired into \"prompt\". " +
                     "drag a Prompt node out of the palette and connect it"
             )
-        // ⚠ LoRA tags are taken out, not sent: no Wan LoRA has run on the NPU here yet.
+        // Resolve <lora:name:strength> tags from the prompt.
         val pos = PromptLoras.extract(wired.positive)
         val neg = PromptLoras.extract(wired.negative)
-        if (pos.tags.isNotEmpty() || neg.tags.isNotEmpty()) {
-            ctx.say("LoRA tags skipped: Wan video takes no LoRAs yet")
+        val loraDir = com.abrah.nightmare.BackendProcess.lorasDir(android)
+        val installed = loraDir.list()?.toList().orEmpty()
+        val resolved = (pos.tags + neg.tags).mapNotNull { tag ->
+            val file = PromptLoras.resolve(tag.name, installed)
+            if (file == null) {
+                ctx.say("LoRA '${tag.name}' not found in ${loraDir.absolutePath}")
+                null
+            } else {
+                java.io.File(loraDir, file).absolutePath to tag.strength
+            }
+        }
+        if (resolved.isNotEmpty()) {
+            ctx.say("Applying ${resolved.size} LoRA(s)")
         }
         val p = effectiveParams(node)
         val (w, h) = sizeOf(p)
@@ -197,10 +210,14 @@ object WanVideoNode : NodeType {
         ctx.say("seed $used, ${w}x$h, $frames frames" + if (startPng != null) ", animating your picture" else "")
         Log.i(TAG, "wan: seed $used ${w}x$h x$frames i2v=${startPng != null}")
 
+        val steps = p["steps"]?.toIntOrNull() ?: (SIGMAS.size - 1)
+        val cfg = p["cfg"]?.toFloatOrNull() ?: 1.0f
+        // For Turbo schedule keep the fixed sigmas when steps==4; otherwise let backend use steps.
+        val sigmas = if (steps == SIGMAS.size - 1) SIGMAS else emptyList()
         val r = ctx.host.video(
             prompt = pos.text, negative = neg.text, width = w, height = h, frames = frames, fps = FPS,
-            seed = used, steps = SIGMAS.size - 1, sampleMethod = "lcm", sigmas = SIGMAS, tilingArgs = TILING,
-            out = raw.absolutePath, startPng = startPng, loras = emptyList(),
+            seed = used, steps = steps, sampleMethod = "lcm", sigmas = sigmas, tilingArgs = TILING,
+            out = raw.absolutePath, startPng = startPng, loras = resolved,
         ) { pr -> ctx.onProgress(pr) }
         val clip = when (r) {
             is Ops.Result.Ok -> r.value
